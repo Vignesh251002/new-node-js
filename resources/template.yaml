@@ -1,0 +1,312 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Deploy Express.js App on EC2 with IAM Role and S3 Access
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ExpressApp
+    Description: Name of the project/application
+
+  Environment:
+    Type: String
+    Default: dev
+    Description: Deployment environment
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair
+
+  BucketName:
+    Type: String
+    Description: S3 Bucket name where the application zip is stored
+    Default: test-ec2-s3bucket
+
+  ZipFile:
+    Type: String
+    Description: Name of the application zip file in the S3 bucket
+    Default: app.zip
+
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t3.micro
+      - t3.small
+
+Resources:
+  ###############################################
+  # IAM ROLE FOR EC2
+  ###############################################
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-${ProjectName}-EC2-Role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${BucketName}"
+                  - !Sub "arn:aws:s3:::${BucketName}/*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProjectName}-Role"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${Environment}-${ProjectName}-InstanceProfile"
+      Roles:
+        - !Ref EC2Role
+
+  ###############################################
+  # SECURITY GROUP
+  ###############################################
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${Environment}-${ProjectName}-sg"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH Access
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+          Description: Express App Port
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP Access
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProjectName}-sg"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ###############################################
+  # EC2 INSTANCE
+  ###############################################
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: EC2InstanceProfile
+    Properties:
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      KeyName: !Ref KeyPairName
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      ImageId: ami-0cae6d6fe6048ca2c
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProjectName}-instance"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            set -e
+            exec > >(tee /var/log/user-data.log) 2>&1
+
+            echo "=========================================="
+            echo "Starting deployment at $(date)"
+            echo "=========================================="
+
+            # Install packages
+            echo "Installing system packages..."
+            dnf update -y
+            dnf install -y nodejs npm unzip nginx
+
+            # Install PM2
+            echo "Installing PM2..."
+            npm install -g pm2
+
+            # Create app directory
+            mkdir -p /home/ec2-user/app
+            chown -R ec2-user:ec2-user /home/ec2-user
+
+            # Download app.zip
+            cd /home/ec2-user
+            echo "Downloading application from S3..."
+            aws s3 cp s3://${BucketName}/${ZipFile} app.zip
+
+            echo "Extracting application..."
+            unzip -o app.zip -d app
+            cd app
+
+            # AUTO-FIX NESTED DIRECTORY
+            if [ -d "app" ] && [ -f "app/app.js" ]; then
+              echo "Detected nested folder. Fixing..."
+              mv app/* .
+              rm -rf app
+            fi
+
+            # Check for entry file
+            if [ ! -f "app.js" ] && [ ! -f "index.js" ]; then
+              echo "✗ Error: No app.js or index.js found"
+              ls -la
+              exit 1
+            fi
+
+            ENTRY_FILE="app.js"
+            if [ ! -f "app.js" ] && [ -f "index.js" ]; then
+              ENTRY_FILE="index.js"
+            fi
+            echo "Using entry file: $ENTRY_FILE"
+
+            # Install dependencies
+            echo "Installing npm dependencies..."
+            sudo -u ec2-user npm install --omit=dev
+
+            # Start with PM2
+            echo "Starting application with PM2..."
+            sudo -u ec2-user pm2 start $ENTRY_FILE --name myapp
+            sudo -u ec2-user pm2 save
+
+            # PM2 Autostart
+            env PATH=$PATH:/usr/bin pm2 startup systemd -u ec2-user --hp /home/ec2-user
+            systemctl enable pm2-ec2-user
+
+            # Configure Nginx as Reverse Proxy
+            echo "Configuring Nginx..."
+            cat > /etc/nginx/conf.d/express-app.conf <<'EOF'
+            server {
+                listen 80;
+                server_name _;
+
+                # Access and error logs
+                access_log /var/log/nginx/express-app-access.log;
+                error_log /var/log/nginx/express-app-error.log;
+
+                # Proxy to Express app
+                location / {
+                    proxy_pass http://localhost:3000;
+                    proxy_http_version 1.1;
+                    
+                    # WebSocket support
+                    proxy_set_header Upgrade $http_upgrade;
+                    proxy_set_header Connection 'upgrade';
+                    
+                    # Pass headers
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                    
+                    # Timeouts
+                    proxy_connect_timeout 60s;
+                    proxy_send_timeout 60s;
+                    proxy_read_timeout 60s;
+                    
+                    # Disable cache for development
+                    proxy_cache_bypass $http_upgrade;
+                }
+
+                # Health check endpoint
+                location /health {
+                    access_log off;
+                    return 200 "healthy\n";
+                    add_header Content-Type text/plain;
+                }
+            }
+            EOF
+
+            # Remove default Nginx config
+            rm -f /etc/nginx/conf.d/default.conf
+
+            # Test Nginx configuration
+            echo "Testing Nginx configuration..."
+            nginx -t
+
+            # Start and enable Nginx
+            echo "Starting Nginx..."
+            systemctl start nginx
+            systemctl enable nginx
+
+            # Verify services are running
+            echo "Verifying services..."
+            sleep 3
+            
+            if sudo -u ec2-user pm2 list | grep -q "online"; then
+              echo "✓ PM2 app is online"
+            else
+              echo "✗ PM2 app failed"
+              exit 1
+            fi
+
+            if systemctl is-active --quiet nginx; then
+              echo "✓ Nginx is running"
+            else
+              echo "✗ Nginx failed to start"
+              exit 1
+            fi
+
+            # Test the proxy
+            if curl -s http://localhost:80 > /dev/null; then
+              echo " Nginx proxy is working"
+            else
+              echo " Nginx proxy test failed"
+            fi
+
+            echo "=========================================="
+            echo "Deployment completed at $(date)"
+            echo "App accessible at: http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)"
+            echo "=========================================="
+
+
+###############################################
+# OUTPUTS
+###############################################
+Outputs:
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref EC2Instance
+  
+  PublicIP:
+    Description: Public IP of the EC2 instance
+    Value: !GetAtt EC2Instance.PublicIp
+  
+  AppURL:
+    Description: URL to access the Express application
+    Value: !Sub "http://${EC2Instance.PublicIp}:3000"
+  
+  SSHCommand:
+    Description: SSH command to connect
+    Value: !Sub "ssh -i ${KeyPairName}.pem ec2-user@${EC2Instance.PublicIp}"
+  
+  RoleName:
+    Description: IAM Role Name
+    Value: !Ref EC2Role
+  
+  InstanceProfileName:
+    Description: IAM Instance Profile Name
+    Value: !Ref EC2InstanceProfile
