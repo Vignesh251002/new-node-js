@@ -1,0 +1,30 @@
+version: 0.0
+os: linux
+files:
+  - source: app/
+    destination: /home/ec2-user/app
+
+hooks:
+  BeforeInstall:
+    - location: scripts/install_node.sh
+      timeout: 300
+      runas: root
+
+    - location: scripts/install_nginx.sh
+      timeout: 300
+      runas: root
+
+  AfterInstall:
+    - location: scripts/install_dependencies.sh
+      timeout: 300
+      runas: ec2-user
+
+  ApplicationStop:
+    - location: scripts/stop_app.sh
+      timeout: 180
+      runas: ec2-user
+
+  ApplicationStart:
+    - location: scripts/start_app.sh
+      timeout: 180
+      runas: ec2-user
